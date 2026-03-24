@@ -4,6 +4,7 @@ import uuid
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import numpy as np
 from .explain import compare_explainers
 from .analyse import  analyze_comparison
 
