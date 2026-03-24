@@ -1,3 +1,25 @@
+# Installation In Instructions
+
+Clone the repo.
+
+```bash
+!git clone https://github.com/Text-Machine/mask-predict.git
+```
+
+Move to the folder.
+
+```bash
+%cd mask-predict
+```
+
+Install the module.
+
+```bash
+!pip install -e .
+```
+
+Look at the `compute_influence_improved.ipynb` notebook for example usage of the code.
+
 # How Integrated Gradients Works in This Notebook
 
 ## Overview
