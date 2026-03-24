@@ -6,21 +6,21 @@ build-backend = "setuptools.build_meta"
 name = "mask-predict"
 version = "0.1.0"
 description = "A package for explaining predictions made by masked language models."
-authors = [{ name = "Your Name", email = "your.email@example.com" }]
-license = { text = "MIT" }
 readme = "README.md"
-homepage = "https://github.com/YourUsername/mask-predict"
-repository = "https://github.com/YourUsername/mask-predict"
-keywords = ["explain", "masked language model", "NLP", "machine learning"]
+license = "MIT"
+requires-python = ">=3.6"
+dependencies = [
+    "torch",
+    "transformers",
+    "captum",
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "seaborn",
+]
 
-[tool.setuptools]
-packages = ["explain"]
+[project.urls]
+Homepage = "https://github.com/YourUsername/mask-predict"
 
-[project.dependencies]
-torch = "^1.9.0"
-transformers = "^4.0.0"
-captum = "^0.4.0"
-pandas = "^1.2.0"
-numpy = "^1.19.0"
-matplotlib = "^3.3.0"
-seaborn = "^0.11.0"
+[tool.setuptools.packages.find]
+include = ["explain", "explain.*"]
