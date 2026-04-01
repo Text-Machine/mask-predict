@@ -7,6 +7,9 @@ import seaborn as sns
 import numpy as np
 from .explain import compare_explainers
 from .analyse import  analyze_comparison
+import plotly.express as px
+import plotly.graph_objects as go
+from sklearn.manifold import TSNE
 
 def _attr_to_rgba(score, max_abs):
     if max_abs <= 0:
@@ -393,3 +396,87 @@ def render_top_shift_sentences(
             display(HTML(html))
 
     return rendered
+
+# -----------------------------
+# Experimental code for token embedding visualization
+# -----------------------------
+
+
+def plot_token_embeddings_interactive(
+    token_embeddings_df,
+    perplexity=30,
+    random_state=42,
+    point_size=3,
+    opacity=0.75,
+):
+    required_cols = {"cluster", "Token", "embedding"}
+    missing_cols = required_cols - set(token_embeddings_df.columns)
+    if missing_cols:
+        missing_display = ", ".join(sorted(missing_cols))
+        raise ValueError(f"token_embeddings_df is missing required columns: {missing_display}")
+
+    plot_df = token_embeddings_df[["Token", "cluster", "embedding"]].copy()
+    plot_df["cluster"] = plot_df["cluster"].astype(str)
+
+    embedding_matrix = np.vstack(plot_df["embedding"].to_numpy()).astype(np.float32)
+    n_samples = embedding_matrix.shape[0]
+    if n_samples < 3:
+        raise ValueError("Need at least 3 tokens to compute t-SNE.")
+
+    valid_perplexity = min(perplexity, max(2, n_samples - 1))
+    tsne = TSNE(
+        n_components=2,
+        perplexity=valid_perplexity,
+        random_state=random_state,
+        init="pca",
+        learning_rate="auto",
+    )
+    token_embedding_2d = tsne.fit_transform(embedding_matrix)
+    plot_df["tsne_x"] = token_embedding_2d[:, 0]
+    plot_df["tsne_y"] = token_embedding_2d[:, 1]
+
+    fig = px.scatter(
+        plot_df,
+        x="tsne_x",
+        y="tsne_y",
+        color="cluster",
+        hover_data=["Token"],
+        title="Token Embeddings (t-SNE) by Cluster",
+        opacity=opacity,
+        color_discrete_sequence=px.colors.qualitative.Set2,
+    )
+
+    fig.update_traces(
+        marker={"size": point_size, "line": {"width": 0}},
+        selector={"mode": "markers"},
+    )
+
+    center_df = (
+        plot_df.groupby("cluster", as_index=False)[["tsne_x", "tsne_y"]]
+        .mean()
+        .sort_values("cluster")
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=center_df["tsne_x"],
+            y=center_df["tsne_y"],
+            mode="markers+text",
+            text=center_df["cluster"],
+            textposition="top center",
+            marker={
+                "symbol": "x",
+                "size": 14,
+                "line": {"width": 2},
+            },
+            name="cluster centers (t-SNE mean)",
+            hovertemplate="cluster=%{text}<extra></extra>",
+        )
+    )
+
+    fig.update_layout(
+        xaxis_title="t-SNE 1",
+        yaxis_title="t-SNE 2",
+        legend_title_text="Cluster",
+        template="plotly_white",
+    )
+    return fig

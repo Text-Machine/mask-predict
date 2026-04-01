@@ -1,6 +1,7 @@
 import torch
 from transformers import AutoTokenizer, AutoModelForMaskedLM
 from captum.attr import IntegratedGradients
+from tqdm.auto import tqdm
 
 class MaskedLMExplainer:
     def __init__(self, model_name="bert-base-uncased", device=None):
@@ -82,12 +83,18 @@ class MaskedLMExplainer:
         drop_special=True,
         return_word_scores=True,
         word_agg="mean",  # "mean" or "max"
+        show_progress=True,
+        progress_desc="Explaining",
     ):
         if len(texts) != len(target_words_list):
             raise ValueError("texts and target_words_list must have same length")
 
         all_results = []
-        for text, targets in zip(texts, target_words_list):
+        iterator = zip(texts, target_words_list)
+        if show_progress:
+            iterator = tqdm(iterator, total=len(texts), desc=progress_desc)
+
+        for text, targets in iterator:
             sent_out = {}
 
             for target in targets:
