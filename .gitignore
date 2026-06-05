@@ -218,4 +218,9 @@ __marimo__/
 # folder
 masking_data/*
 processed_data/*
+ 
+# Local experiment data artifacts (already hosted remotely)
+ExperimentsData/**/*.zip
+ExperimentsData/**/*.tsv
+ExperimentsData/__MACOSX/
 .DS_Store
