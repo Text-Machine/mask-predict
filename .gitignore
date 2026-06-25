@@ -219,3 +219,8 @@ __marimo__/
 masking_data/*
 processed_data/*
 .DS_Store
+
+input_data/*
+output_data/*
+gradient_data/*
+backup/*
