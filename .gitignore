@@ -224,3 +224,4 @@ input_data/*
 output_data/*
 gradient_data/*
 backup/*
+colab_data/*
