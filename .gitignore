@@ -225,3 +225,5 @@ output_data/*
 gradient_data/*
 backup/*
 colab_data/*
+sentences/*
+visualisation/*

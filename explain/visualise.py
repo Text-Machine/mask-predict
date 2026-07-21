@@ -10,6 +10,9 @@ from .analyse import  analyze_comparison
 import plotly.express as px
 import plotly.graph_objects as go
 from sklearn.manifold import TSNE
+from matplotlib.patches import Rectangle
+import matplotlib.cm as cm
+import squarify
 
 def _attr_to_rgba(score, max_abs):
     if max_abs <= 0:
@@ -480,3 +483,135 @@ def plot_token_embeddings_interactive(
         template="plotly_white",
     )
     return fig
+
+"""
+Visualize the value counts of a categorical column ('semantic') as a
+proportional-square (treemap-style) chart, with the value name and its
+share printed on each square.
+
+Requires: pandas, matplotlib, squarify
+    pip install squarify --break-system-packages
+"""
+
+
+
+def _label_lines(name, count, pct):
+    return [f"{name}", f"{count:,} ({pct:.1%})"]
+
+
+def plot_semantic_squares(
+    df: pd.DataFrame,
+    column: str = "semantic",
+    top_n: int | None = None,
+    figsize: tuple = (11, 7),
+    title: str | None = None,
+    fontsize: int = 10,
+):
+    """
+    Draw a proportional-square chart for the value counts of `column`.
+    Small squares get their label pushed out to the margin with a
+    leader-line arrow instead of overlapping text crammed inside.
+
+    Parameters
+    ----------
+    df : DataFrame containing the column to visualise.
+    column : name of the column to summarise (default 'semantic').
+    top_n : if set, keep only the top_n most frequent values and group
+            everything else into an 'Other' square.
+    figsize : matplotlib figure size.
+    title : chart title; defaults to "Distribution of <column>".
+    fontsize : base font size for labels.
+    """
+    counts = df[column].value_counts(dropna=False)
+
+    if top_n is not None and len(counts) > top_n:
+        top = counts.iloc[:top_n]
+        other_total = counts.iloc[top_n:].sum()
+        counts = pd.concat([top, pd.Series({"Other": other_total})])
+
+    total = counts.sum()
+    proportions = counts / total
+
+    names = list(counts.index.astype(str))
+    values = counts.values.astype(float)
+
+    # --- Layout the treemap in a 0-100 x 0-100 box ---
+    PAD = 32  # margin reserved on each side for overflow labels
+    sizes = squarify.normalize_sizes(values, 100, 100)
+    rects = squarify.squarify(sizes, 0, 0, 100, 100)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.set_xlim(-PAD, 100 + PAD)
+    ax.set_ylim(-8, 108)
+    ax.axis("off")
+    ax.set_aspect("equal")
+    fig.canvas.draw()  # need a renderer to measure text extents
+    renderer = fig.canvas.get_renderer()
+
+    colors = (cm.tab20.colors * (len(rects) // 20 + 1))[: len(rects)]
+
+    # Pixels-per-data-unit, used to compare box size against text size
+    p0 = ax.transData.transform((0, 0))
+    p1 = ax.transData.transform((1, 1))
+    px_per_unit_x = abs(p1[0] - p0[0])
+    px_per_unit_y = abs(p1[1] - p0[1])
+
+    overflow = []  # boxes whose label didn't fit -> (cx, cy, name, count, pct, color)
+
+    for rect, name, count, pct, color in zip(rects, names, counts.values, proportions.values, colors):
+        x, y, dx, dy = rect["x"], rect["y"], rect["dx"], rect["dy"]
+        ax.add_patch(Rectangle((x, y), dx, dy, facecolor=color, edgecolor="white", linewidth=1.5))
+
+        lines = _label_lines(name, count, pct)
+        # Measure the widest line's rendered pixel width/height at this fontsize
+        probe = ax.text(0, 0, "\n".join(lines), fontsize=fontsize, ha="center", va="center")
+        bbox = probe.get_window_extent(renderer=renderer)
+        probe.remove()
+
+        text_w_px, text_h_px = bbox.width, bbox.height
+        box_w_px, box_h_px = dx * px_per_unit_x, dy * px_per_unit_y
+
+        fits = (text_w_px < box_w_px * 0.92) and (text_h_px < box_h_px * 0.85)
+
+        if fits:
+            ax.text(
+                x + dx / 2, y + dy / 2, "\n".join(lines),
+                ha="center", va="center", fontsize=fontsize, color="black",
+            )
+        else:
+            overflow.append((x + dx / 2, y + dy / 2, name, count, pct, color))
+
+    # --- Place overflow labels in the side margins with leader arrows ---
+    if overflow:
+        left = [o for o in overflow if o[0] < 50]
+        right = [o for o in overflow if o[0] >= 50]
+
+        for side, items in (("left", left), ("right", right)):
+            items.sort(key=lambda o: -o[1])  # top to bottom, matches visual order
+            n = len(items)
+            if n == 0:
+                continue
+            top_y, bot_y = 100, 0
+            step = (top_y - bot_y) / n
+            label_x = -PAD + 4 if side == "left" else 100 + PAD - 4
+            ha = "left" if side == "left" else "right"
+
+            for i, (bx, by, name, count, pct, color) in enumerate(items):
+                label_y = top_y - step * (i + 0.5)
+                lines = _label_lines(name, count, pct)
+                ax.annotate(
+                    "\n".join(lines),
+                    xy=(bx, by), xycoords="data",
+                    xytext=(label_x, label_y), textcoords="data",
+                    ha=ha, va="center", fontsize=fontsize - 1,
+                    arrowprops=dict(
+                        arrowstyle="-", color=color, lw=1.3,
+                        shrinkA=0, shrinkB=4,
+                        connectionstyle="arc3,rad=0.0",
+                    ),
+                    bbox=dict(boxstyle="round,pad=0.25", fc="white", ec=color, lw=1.0),
+                )
+
+    ax.set_title(title or f"Distribution of '{column}'", fontsize=14, fontweight="bold", pad=12)
+    plt.tight_layout()
+    return fig, ax
