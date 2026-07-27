@@ -20,6 +20,21 @@ def pick_device():
     return "cpu"
 
 
+def filter_texts_targets(texts, predicted_targets, kw_filters, data_df, only_keywords=False):
+    filtered_texts = []
+    filtered_predicted_targets = []
+    filter_identifiers = []
+    for i,(text, preds) in enumerate(zip(texts, predicted_targets)):
+        if set(preds).intersection(set(kw_filters)):
+            filtered_texts.append(text)
+            filter_identifiers.append(i)
+            if only_keywords:
+                preds = [p for p in preds if p in kw_filters]
+                if not preds:
+                    continue
+            filtered_predicted_targets.append([data_df.targetExpression.iloc[i]]+preds)
+    return filter_identifiers, filtered_texts, filtered_predicted_targets
+
 def add_pseudo_perplexity_column(
     data_df,
     checkpoint,
