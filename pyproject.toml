@@ -15,6 +15,7 @@ dependencies = [
     "captum",
     "numpy",
     "pandas",
+    "squarify",
     "matplotlib",
     "seaborn",
     "scikit-learn",
