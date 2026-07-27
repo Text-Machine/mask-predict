@@ -1,11 +1,14 @@
 
 
+import math
+
 import torch
 import ast
 from tqdm import tqdm
 import pandas as pd
 from spacy.tokens import Doc
 import spacy
+from transformers import AutoTokenizer, AutoModelForMaskedLM
 
 
 
@@ -15,6 +18,110 @@ def pick_device():
     if torch.cuda.is_available():
         return "cuda"
     return "cpu"
+
+
+def add_pseudo_perplexity_column(
+    data_df,
+    checkpoint,
+    text_col="currentSentence",
+    output_col="token_pseudo_ppl",
+    device=None,
+    max_length=512,
+    batch_size=None,
+    use_amp=True,
+):
+    """Add a column to `data_df` with, per row, a dict mapping each token in
+    `text_col` to its pseudo perplexity under a BERT masked LM (Salazar et al., 2019):
+    exp(-log P(token | rest of sentence)), where the token itself is masked out.
+
+    All maskings for a given sentence are scored in one batched forward pass
+    (instead of one token at a time), which is the main lever for throughput on
+    an M1's unified-memory GPU (MPS) or a Colab GPU alike. `device` auto-selects
+    via pick_device() (mps > cuda > cpu) if not given; `batch_size` similarly
+    defaults per device (large on cuda, modest on mps/cpu) but can be overridden,
+    e.g. bumped up further on a roomy Colab GPU. `use_amp` enables autocast (fp16)
+    on cuda/mps for extra throughput; it's a no-op on cpu. Repeated tokens in the
+    same sentence get a `token#position` key so they don't overwrite each other.
+    """
+    device = device or pick_device()
+    if batch_size is None:
+        batch_size = {"cuda": 64, "mps": 16}.get(device, 8)
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+    model = AutoModelForMaskedLM.from_pretrained(checkpoint).to(device)
+    model.eval()
+
+    # tokenizer.model_max_length is often left at a bogus huge sentinel value by
+    # checkpoints that never set it, so cap max_length at what the model's
+    # position embeddings can actually hold to avoid an out-of-range index error
+    # on long sentences.
+    model_max_length = getattr(model.config, "max_position_embeddings", max_length)
+    max_length = min(max_length, model_max_length)
+
+    mask_id = tokenizer.mask_token_id
+    results = []
+
+    amp_enabled = use_amp and device in ("cuda", "mps")
+    autocast_ctx = torch.autocast(
+        device_type=device, dtype=torch.float16, enabled=amp_enabled
+    )
+    pin = device == "cuda"
+
+    with torch.inference_mode(), autocast_ctx:
+        for text in tqdm(data_df[text_col].tolist(), desc="Pseudo-perplexity"):
+            encoded = tokenizer(
+                text, truncation=True, max_length=max_length, return_tensors="pt"
+            )
+            input_ids = encoded["input_ids"][0]
+            attention_mask = encoded["attention_mask"][0]
+            special_mask = tokenizer.get_special_tokens_mask(
+                input_ids.tolist(), already_has_special_tokens=True
+            )
+            positions = [i for i, m in enumerate(special_mask) if m == 0]
+
+            token_ppls = {}
+            seen = set()
+
+            for start in range(0, len(positions), batch_size):
+                chunk_positions = positions[start : start + batch_size]
+                chunk = len(chunk_positions)
+
+                batch_input_ids = input_ids.unsqueeze(0).repeat(chunk, 1).clone()
+                batch_attention_mask = attention_mask.unsqueeze(0).repeat(chunk, 1)
+                pos_tensor = torch.tensor(chunk_positions, dtype=torch.long)
+                row_idx = torch.arange(chunk)
+                batch_input_ids[row_idx, pos_tensor] = mask_id
+
+                if pin:
+                    batch_input_ids = batch_input_ids.pin_memory()
+                    batch_attention_mask = batch_attention_mask.pin_memory()
+
+                batch_input_ids = batch_input_ids.to(device, non_blocking=pin)
+                batch_attention_mask = batch_attention_mask.to(device, non_blocking=pin)
+                pos_tensor = pos_tensor.to(device)
+                row_idx = row_idx.to(device)
+
+                logits = model(
+                    input_ids=batch_input_ids, attention_mask=batch_attention_mask
+                ).logits  # (chunk, seq_len, vocab)
+
+                # gather only the masked position's logits before softmax, so we
+                # never materialize a (chunk, seq_len, vocab) softmax on the GPU
+                target_logits = logits[row_idx, pos_tensor].float()  # (chunk, vocab)
+                log_probs = torch.log_softmax(target_logits, dim=-1)
+
+                target_ids = input_ids[torch.tensor(chunk_positions, dtype=torch.long)].to(device)
+                token_log_probs = log_probs[row_idx, target_ids].cpu().tolist()
+
+                for pos, tid, log_p in zip(chunk_positions, target_ids.cpu().tolist(), token_log_probs):
+                    token_str = tokenizer.convert_ids_to_tokens(tid)
+                    key = token_str if token_str not in seen else f"{token_str}#{pos}"
+                    seen.add(token_str)
+                    token_ppls[key] = math.exp(-log_p)
+
+            results.append(token_ppls)
+
+    data_df[output_col] = results
+    return data_df
 
 def parse_pred_column(cell, top_n=5):
     # expected format: "[('word1', score1), ('word2', score2), ...]"
