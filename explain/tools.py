@@ -45,9 +45,10 @@ def add_pseudo_perplexity_column(
     batch_size=None,
     use_amp=True,
 ):
-    """Add a column to `data_df` with, per row, a dict mapping each token in
-    `text_col` to its pseudo perplexity under a BERT masked LM (Salazar et al., 2019):
-    exp(-log P(token | rest of sentence)), where the token itself is masked out.
+    """Add a column to `data_df` with, per row, a list of (token, perplexity)
+    tuples in sentence order for each token in `text_col`, scored under a BERT
+    masked LM (Salazar et al., 2019): exp(-log P(token | rest of sentence)),
+    where the token itself is masked out.
 
     All maskings for a given sentence are scored in one batched forward pass
     (instead of one token at a time), which is the main lever for throughput on
@@ -55,8 +56,7 @@ def add_pseudo_perplexity_column(
     via pick_device() (mps > cuda > cpu) if not given; `batch_size` similarly
     defaults per device (large on cuda, modest on mps/cpu) but can be overridden,
     e.g. bumped up further on a roomy Colab GPU. `use_amp` enables autocast (fp16)
-    on cuda/mps for extra throughput; it's a no-op on cpu. Repeated tokens in the
-    same sentence get a `token#position` key so they don't overwrite each other.
+    on cuda/mps for extra throughput; it's a no-op on cpu.
     """
     device = device or pick_device()
     if batch_size is None:
@@ -93,8 +93,7 @@ def add_pseudo_perplexity_column(
             )
             positions = [i for i, m in enumerate(special_mask) if m == 0]
 
-            token_ppls = {}
-            seen = set()
+            token_ppls = []
 
             for start in range(0, len(positions), batch_size):
                 chunk_positions = positions[start : start + batch_size]
@@ -127,11 +126,9 @@ def add_pseudo_perplexity_column(
                 target_ids = input_ids[torch.tensor(chunk_positions, dtype=torch.long)].to(device)
                 token_log_probs = log_probs[row_idx, target_ids].cpu().tolist()
 
-                for pos, tid, log_p in zip(chunk_positions, target_ids.cpu().tolist(), token_log_probs):
+                for tid, log_p in zip(target_ids.cpu().tolist(), token_log_probs):
                     token_str = tokenizer.convert_ids_to_tokens(tid)
-                    key = token_str if token_str not in seen else f"{token_str}#{pos}"
-                    seen.add(token_str)
-                    token_ppls[key] = math.exp(-log_p)
+                    token_ppls.append((token_str, math.exp(-log_p)))
 
             results.append(token_ppls)
 
