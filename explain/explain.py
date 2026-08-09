@@ -1,79 +1,125 @@
+"""
+Corrected/hardened version of `MaskedLMExplainer` from `explain.py`.
+
+This does NOT change `explain.py` — it subclasses `MaskedLMExplainer` so it's
+a drop-in replacement (`MaskedLMExplainerImproved(...)` instead of
+`MaskedLMExplainer(...)`), while reusing everything about the original that
+was already correct (`forward_func`, target tokenization, word aggregation).
+
+Issues found in `explain.py` and fixed here
+--------------------------------------------
+1. **Baseline blanks out [CLS]/[SEP] instead of keeping them fixed.**
+   `baseline_ids = torch.full_like(input_ids, pad_token_id)` overwrites every
+   position — including CLS and SEP — with the PAD id. Only the mask
+   position(s) are then restored to match the input. Standard practice for
+   IG on transformers (see Captum's own BERT tutorial) is the opposite:
+   keep special tokens identical between input and baseline, and only swap
+   the *content* tokens for the reference id. Otherwise:
+     - part of the attribution mass gets assigned to the CLS/SEP embedding
+       "moving" from PAD to CLS/SEP along the interpolation path, silently
+       discarded later by `drop_special=True` — so the reported per-token
+       scores no longer sum to F(input) - F(baseline) (completeness axiom
+       broken for what's actually reported).
+     - the L2 norm used to normalize scores is computed over *all* positions
+       (including this CLS/SEP noise) before special tokens are dropped,
+       which scales down the real content-token scores.
+   Fixed by only replacing non-special, non-mask positions with the
+   reference token id; CLS/SEP embeddings are then identical in input and
+   baseline, so their IG contribution is (numerically) ~0 by construction.
+
+2. **`pick_device()` used but never imported in `explain.py`.**
+   `self.device = device or pick_device()` references a name that only
+   exists in `explain/tools.py` / the package's `__init__.py`, not in
+   `explain.py`'s own namespace. Every current notebook happens to always
+   pass `device=pick_device()` explicitly, so this has never actually fired,
+   but `MaskedLMExplainer(model_name=...)` with no `device` would raise
+   `NameError`. Fixed by importing `pick_device` and resolving it in this
+   module before calling into the parent `__init__`.
+
+3. **No convergence check.** `ig.attribute()` was called without
+   `return_convergence_delta=True`, so there was no way to tell whether the
+   IG approximation (50 steps by default, against a `log_softmax` over the
+   full vocabulary) had actually converged for a given example. Fixed by
+   requesting the delta, exposing it in the result dict as
+   `"convergence_delta"`, and optionally warning when it exceeds
+   `convergence_warn_threshold`. `n_steps` / `internal_batch_size` are now
+   also configurable instead of hard-coded to Captum's defaults.
+
+4. **Normalization order.** `attrs` was L2-normalized *before*
+   `attrs[mask_pos] = 0.0`, so the (small but nonzero, due to IG's numerical
+   approximation) mask-position value contributed to the scale used for
+   every other token. Fixed by zeroing the mask position(s) first.
+
+Not changed (considered correct, or a deliberate modeling choice worth
+documenting rather than "fixing"):
+- `forward_func`'s handling of multi-token targets: it sums log p(target
+  subtoken_k | context) over the K masked positions in a single forward
+  pass. This is a pseudo-log-likelihood approximation of the joint
+  probability of the multi-token target (not the true joint, which would
+  require sequential/autoregressive infilling) — standard for BERT-style
+  cloze scoring, but worth knowing when interpreting attribution magnitude
+  for multi-token targets vs. single-token ones.
+- Using the PAD embedding as the reference/baseline for content tokens is a
+  design choice (also used in Captum's own tutorial), not a bug — a
+  zero-vector or average-embedding baseline would be a legitimate
+  alternative but changes what "no information" means, not "correctness".
+"""
+
+import warnings
+
 import torch
-from transformers import AutoTokenizer, AutoModelForMaskedLM
-from captum.attr import IntegratedGradients
-from tqdm.auto import tqdm
 
-class MaskedLMExplainer:
-    def __init__(self, model_name="bert-base-uncased", device=None):
-        self.device = device or pick_device()
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForMaskedLM.from_pretrained(model_name).to(self.device)
-        self.model.eval()
-        self.ig = IntegratedGradients(self.forward_func)
+from .explain import MaskedLMExplainer
+from .tools import pick_device
 
-    # Supports K mask positions / K target tokens per example
-    def forward_func(self, inputs_embeds, attention_mask, mask_indices, target_indices, valid_positions):
-        logits = self.model(inputs_embeds=inputs_embeds, attention_mask=attention_mask).logits  # (B, L, V)
-        bsz = logits.size(0)
 
-        # (B, K, V): logits at each masked position
-        mask_logits = logits[
-            torch.arange(bsz, device=logits.device).unsqueeze(1),
-            mask_indices
-        ]
-        log_probs = torch.log_softmax(mask_logits, dim=-1)  # (B, K, V)
+class MaskedLMExplainerImproved(MaskedLMExplainer):
+    def __init__(
+        self,
+        model_name="bert-base-uncased",
+        device=None,
+        n_steps=50,
+        internal_batch_size=None,
+        convergence_warn_threshold=0.05,
+    ):
+        # Resolve device here (in this module's own namespace, where
+        # `pick_device` actually exists) before calling into the parent
+        # `__init__`, so its buggy `device or pick_device()` fallback never
+        # has to execute.
+        if device is None:
+            device = pick_device()
+        super().__init__(model_name=model_name, device=device)
 
-        # (B, K): log p(target_token_k | context)
-        target_lp = log_probs.gather(-1, target_indices.unsqueeze(-1)).squeeze(-1)
+        # Reference/baseline token id for "no content" positions, matching
+        # Captum's IG-for-BERT convention. Falls back to unk_token_id for
+        # tokenizers without a dedicated pad token.
+        self.ref_token_id = self.tokenizer.pad_token_id
+        if self.ref_token_id is None:
+            self.ref_token_id = self.tokenizer.unk_token_id
+        if self.ref_token_id is None:
+            raise ValueError(
+                "Tokenizer has neither a pad_token nor an unk_token to use as "
+                "the IG reference/baseline id."
+            )
 
-        # Sum only valid positions
-        return (target_lp * valid_positions).sum(dim=1)  # (B,)
+        self.n_steps = n_steps
+        self.internal_batch_size = internal_batch_size
+        self.convergence_warn_threshold = convergence_warn_threshold
 
-    def _target_to_token_ids(self, text_target):
-        ids = self.tokenizer(text_target, add_special_tokens=False)["input_ids"]
-        return ids
-
-    def _expand_single_mask(self, text, n_masks):
-        mask = self.tokenizer.mask_token
-        if text.count(mask) != 1:
-            raise ValueError("Input sentence must contain exactly one [MASK] before expansion.")
-        return text.replace(mask, " ".join([mask] * n_masks), 1)
-    
-    def _aggregate_tokens_to_words(self, token_rows, agg="mean"):
+    def _build_baseline_ids(self, input_ids, mask_pos):
         """
-        token_rows: list[(token, score)]
-        Returns: list[(word, aggregated_score)]
+        Baseline identical to `input_ids` at [CLS]/[SEP]/mask position(s),
+        and set to `self.ref_token_id` everywhere else (the content tokens
+        we actually want attribution for).
         """
-        if agg not in {"mean", "max"}:
-            raise ValueError("agg must be 'mean' or 'max'")
+        keep_as_input = torch.zeros_like(input_ids, dtype=torch.bool)
+        for special_id in (self.tokenizer.cls_token_id, self.tokenizer.sep_token_id):
+            if special_id is not None:
+                keep_as_input |= input_ids == special_id
+        keep_as_input[0, mask_pos] = True
 
-        def reduce_scores(scores):
-            return float(sum(scores) / len(scores)) if agg == "mean" else float(max(scores))
-
-        word_rows = []
-        current_word = None
-        current_scores = []
-
-        for tok, score in token_rows:
-            # BERT WordPiece continuation
-            if tok.startswith("##"):
-                piece = tok[2:]
-                if current_word is None:
-                    current_word = piece
-                    current_scores = [score]
-                else:
-                    current_word += piece
-                    current_scores.append(score)
-            else:
-                if current_word is not None:
-                    word_rows.append((current_word, reduce_scores(current_scores)))
-                current_word = tok
-                current_scores = [score]
-
-        if current_word is not None:
-            word_rows.append((current_word, reduce_scores(current_scores)))
-
-        return word_rows
+        ref = torch.full_like(input_ids, self.ref_token_id)
+        return torch.where(keep_as_input, input_ids, ref)
 
     def explain(
         self,
@@ -82,7 +128,7 @@ class MaskedLMExplainer:
         normalize=True,
         drop_special=True,
         return_word_scores=True,
-        word_agg="mean",  # "mean" or "max"
+        word_agg="mean",
         show_progress=True,
         progress_desc="Explaining",
     ):
@@ -92,6 +138,7 @@ class MaskedLMExplainer:
         all_results = []
         iterator = zip(texts, target_words_list)
         if show_progress:
+            from tqdm.auto import tqdm
             iterator = tqdm(iterator, total=len(texts), desc=progress_desc)
 
         for text, targets in iterator:
@@ -117,24 +164,41 @@ class MaskedLMExplainer:
                     continue
 
                 emb = self.model.get_input_embeddings()(input_ids)
-                baseline_ids = torch.full_like(input_ids, self.tokenizer.pad_token_id)
-                baseline_ids[0, mask_pos] = self.tokenizer.mask_token_id
+
+                # --- FIX 1: baseline keeps CLS/SEP/mask identical to input,
+                # only content tokens move to the reference embedding.
+                baseline_ids = self._build_baseline_ids(input_ids, mask_pos)
                 base = self.model.get_input_embeddings()(baseline_ids)
 
                 mpos = mask_pos.unsqueeze(0)
                 tid = torch.tensor(target_ids, device=self.device).unsqueeze(0)
                 valid = torch.ones_like(tid, dtype=torch.float32, device=self.device)
 
-                attrs = self.ig.attribute(
+                # --- FIX 3: request convergence delta + expose n_steps.
+                attrs, delta = self.ig.attribute(
                     inputs=emb,
                     baselines=base,
                     additional_forward_args=(attention_mask, mpos, tid, valid),
-                ).sum(dim=-1).squeeze(0)
+                    n_steps=self.n_steps,
+                    internal_batch_size=self.internal_batch_size,
+                    return_convergence_delta=True,
+                )
+                delta_val = float(delta.abs().max().item())
+                if self.convergence_warn_threshold is not None and delta_val > self.convergence_warn_threshold:
+                    warnings.warn(
+                        f"IG convergence delta={delta_val:.4f} exceeds threshold "
+                        f"{self.convergence_warn_threshold} for target={target!r}; "
+                        "attribution may be inaccurate (consider raising n_steps).",
+                        stacklevel=2,
+                    )
 
+                attrs = attrs.sum(dim=-1).squeeze(0)
+
+                # --- FIX 4: zero the mask position(s) before normalizing,
+                # not after, so it can't skew the scale.
+                attrs[mask_pos] = 0.0
                 if normalize:
                     attrs = attrs / attrs.norm().clamp_min(1e-12)
-
-                attrs[mask_pos] = 0.0
 
                 tokens = self.tokenizer.convert_ids_to_tokens(input_ids[0].tolist())
                 token_rows = []
@@ -151,6 +215,7 @@ class MaskedLMExplainer:
                     "skipped": False,
                     "target_token_ids": target_ids,
                     "token_attributions": token_rows,
+                    "convergence_delta": delta_val,
                 }
 
                 if return_word_scores:
@@ -163,34 +228,3 @@ class MaskedLMExplainer:
             all_results.append(sent_out)
 
         return all_results
-
-
-def compare_explainers(explainer_1, explainer_2, texts, targets, level="word", word_agg="mean"):
-    r1 = explainer_1.explain(texts, targets, return_word_scores=(level == "word"), word_agg=word_agg)
-    r2 = explainer_2.explain(texts, targets, return_word_scores=(level == "word"), word_agg=word_agg)
-
-    key = "word_attributions" if level == "word" else "token_attributions"
-
-    comparisons = []
-    for i in range(len(texts)):
-        out = {}
-        for target in targets[i]:
-            a = r1[i][target]
-            b = r2[i][target]
-            if a.get("skipped") or b.get("skipped"):
-                out[target] = {"skipped": True, "model1": a, "model2": b}
-                continue
-
-            rows1 = a[key]
-            rows2 = b[key]
-
-            t1 = [x[0] for x in rows1]
-            t2 = [x[0] for x in rows2]
-            if t1 != t2:
-                raise ValueError(f"{level.capitalize()} mismatch at sentence {i}, target '{target}'")
-
-            s1 = [x[1] for x in rows1]
-            s2 = [x[1] for x in rows2]
-            out[target] = list(zip(t1, s1, s2, [x - y for x, y in zip(s1, s2)]))
-        comparisons.append(out)
-    return comparisons

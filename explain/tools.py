@@ -385,3 +385,55 @@ def add_mask_token_distance(
         df_out.loc[idx, distance_col] = distances
 
     return df_out
+
+from typing import List, Tuple, Literal
+
+def merge_subtokens(
+    tokens: List[Tuple[str, float]],
+    agg: Literal["mean", "max", "min", "sum", "first"] = "mean"
+) -> List[Tuple[str, float]]:
+    """
+    Merge WordPiece-style subtokens (prefixed with '##') back into their
+    parent token, aggregating the associated scores.
+
+    Args:
+        tokens: List of (token, score) tuples, e.g. from a tokenizer/model
+                output such as [("Hello", 0.9), ("##world", 0.8), ...]
+        agg: How to combine scores for merged tokens - "mean", "max",
+             "min", "sum", or "first" (keep only the first subtoken's score).
+
+    Returns:
+        List of (merged_token, aggregated_score) tuples.
+    """
+    if not tokens:
+        return []
+
+    agg_funcs = {
+        "mean": lambda scores: sum(scores) / len(scores),
+        "max": max,
+        "min": min,
+        "sum": sum,
+        "first": lambda scores: scores[0],
+    }
+    if agg not in agg_funcs:
+        raise ValueError(f"Unknown agg method: {agg!r}")
+    combine = agg_funcs[agg]
+
+    result = []
+    current_text_parts = [tokens[0][0]]
+    current_scores = [tokens[0][1]]
+
+    for token, score in tokens[1:]:
+        if token.startswith("##"):
+            current_text_parts.append(token[2:])
+            current_scores.append(score)
+        else:
+            # flush the previous merged token
+            result.append(("".join(current_text_parts), combine(current_scores)))
+            current_text_parts = [token]
+            current_scores = [score]
+
+    # flush the last one
+    result.append(("".join(current_text_parts), combine(current_scores)))
+
+    return result

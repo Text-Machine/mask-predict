@@ -227,3 +227,4 @@ backup/*
 colab_data/*
 sentences/*
 visualisation/*
+api_key.json

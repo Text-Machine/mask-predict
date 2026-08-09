@@ -135,6 +135,344 @@ def highlight_context_tokens_multi_target(explainer, sentence, targets, word_agg
         )
     return rendered
 
+
+def _attr_to_mpl_rgba(score, max_abs):
+    """Same colour logic as `_attr_to_rgba`, but as a matplotlib-ready (r,g,b,a) tuple."""
+    if max_abs <= 0:
+        return (0.5, 0.5, 0.5, 0.10)
+    strength = min(abs(score) / max_abs, 1.0)
+    alpha = 0.15 + 0.65 * strength
+    if score >= 0:
+        return (30 / 255, 136 / 255, 229 / 255, alpha)
+    return (229 / 255, 57 / 255, 53 / 255, alpha)
+
+
+def _measure_text(measure_fig, renderer, text, fontsize, weight="normal"):
+    """Width/height (in inches) that `text` would occupy at `fontsize` on `measure_fig`."""
+    t = measure_fig.text(0, 0, text, fontsize=fontsize, fontweight=weight)
+    bbox = t.get_window_extent(renderer=renderer)
+    t.remove()
+    return bbox.width / measure_fig.dpi, bbox.height / measure_fig.dpi
+
+
+def _merge_diff_rows(rows1, rows2, mask_tok):
+    """
+    Merge the word_attributions of two targets on the *same* sentence into a
+    single list[(word, diff_score)] with diff = score(target1) - score(target2),
+    collapsing the (possibly multi-token) [MASK] block into one sentinel
+    entry `(mask_tok, None)` at the position it occurred.
+
+    Raises ValueError if the non-mask context tokens don't line up 1:1 (this
+    would only happen if the two target words somehow led to different
+    tokenization of the surrounding context, which shouldn't normally occur).
+    """
+    ctx1 = [(w, s) for w, s in rows1 if w != mask_tok]
+    ctx2 = [(w, s) for w, s in rows2 if w != mask_tok]
+    words1 = [w for w, _ in ctx1]
+    words2 = [w for w, _ in ctx2]
+    if words1 != words2:
+        raise ValueError(
+            "context tokens differ between the two target words, cannot compute "
+            f"a direct difference: {words1} vs {words2}"
+        )
+
+    mask_idx = next((i for i, (w, _) in enumerate(rows1) if w == mask_tok), None)
+    insert_at = (
+        sum(1 for w, _ in rows1[:mask_idx] if w != mask_tok) if mask_idx is not None else len(ctx1)
+    )
+
+    merged = [(w, s1 - s2) for (w, s1), (_, s2) in zip(ctx1, ctx2)]
+    merged.insert(insert_at, (mask_tok, None))
+    return merged
+
+
+def _wrap_and_layout_sentences(
+    measure_fig, renderer, results, fontsize, x_left, x_right, top_y, bottom_y,
+    mask_tok, color_scale, global_max_abs,
+    line_spacing=1.55, header_gap=1.05, row_gap=0.95, sentence_gap=1.5,
+    token_pad_x=0.045, token_gap_x=0.035,
+):
+    """
+    Lay out every (label, target, rows, ..., mode) entry as wrapped rows of
+    token boxes, top to bottom, starting at `top_y`. Returns (ops, end_y)
+    where `ops` is a list of draw instructions and `end_y` is the
+    y-coordinate the cursor ended on (compare against `bottom_y` to check it
+    fits the page).
+
+    `global_max_abs` is a dict {"single": float, "diff": float} — "single"
+    and "diff" mode rows are kept on separate colour scales since a raw
+    attribution score and a difference-of-two-attributions aren't the same
+    quantity.
+    """
+    line_h = (fontsize / 72.0) * line_spacing
+    y = top_y
+    ops = []
+
+    for label, target, rows, skipped, reason, local_max, mode in results:
+        y -= line_h * header_gap
+        ops.append({
+            "type": "text", "x": x_left, "y": y, "s": label,
+            "fontsize": fontsize + 1, "weight": "bold", "ha": "left", "va": "center",
+        })
+
+        if skipped:
+            y -= line_h * row_gap
+            ops.append({
+                "type": "text", "x": x_left, "y": y, "s": f"Skipped: {reason}",
+                "fontsize": max(fontsize - 1, 6), "style": "italic",
+                "color": (0.55, 0.1, 0.1, 1.0), "ha": "left", "va": "center",
+            })
+            y -= line_h * sentence_gap
+            continue
+
+        max_abs = global_max_abs[mode] if color_scale == "global" else local_max
+        x = x_left
+        y -= line_h * row_gap
+        for word, score in rows:
+            is_mask = word == mask_tok
+            text = f"[{target}]" if is_mask else word
+            weight = "bold" if is_mask else "normal"
+            w_in, _ = _measure_text(measure_fig, renderer, text, fontsize, weight)
+            box_w = w_in + 2 * token_pad_x
+            box_h = line_h * 0.9
+
+            if x + box_w > x_right and x > x_left:
+                x = x_left
+                y -= line_h
+
+            color = (1.0, 0.757, 0.027, 0.9) if is_mask else _attr_to_mpl_rgba(score, max_abs)
+            ops.append({
+                "type": "rect", "x": x, "y": y - box_h / 2, "w": box_w, "h": box_h,
+                "color": color, "edge": (0.6, 0.45, 0.0, 0.9) if is_mask else "none",
+            })
+            ops.append({
+                "type": "text", "x": x + box_w / 2, "y": y, "s": text, "fontsize": fontsize,
+                "weight": weight, "color": "black" if is_mask else (0.05, 0.05, 0.05, 1.0),
+                "ha": "center", "va": "center",
+            })
+            x += box_w + token_gap_x
+
+        y -= line_h * sentence_gap
+
+    return ops, y
+
+
+def plot_highlighted_sentences(
+    explainer,
+    items,
+    word_agg="max",
+    normalize=True,
+    page_size="A4",
+    orientation="portrait",
+    fontsize=11,
+    min_fontsize=6,
+    margin_in=0.75,
+    color_scale="global",
+    title=None,
+    save_path=None,
+    dpi=200,
+    show=True,
+):
+    """
+    Static, print-friendly version of `highlight_context_tokens`: renders
+    several (sentence, target) attribution highlights stacked vertically as
+    wrapped rows of coloured token boxes on a single matplotlib page.
+
+    Two modes per item:
+    - single target: `target` is a word/string. Blue = token supports target
+      prediction, Red = opposes, Gold = [MASK] position (labelled with the
+      target word) — same convention as the interactive HTML version.
+    - diff mode: `target` is a `[word1, word2]` pair. Each context token is
+      coloured by diff = attribution(word1) − attribution(word2): Blue =
+      token favours word1 over word2, Red = favours word2 over word1, Gold =
+      [MASK] position (labelled "word1 → word2"). Useful for e.g. comparing
+      how context supports "machine" vs "engine" in the same sentence.
+
+    Parameters
+    ----------
+    explainer : object with an `.explain()` method (and `.tokenizer`), as
+        used by `highlight_context_tokens`.
+    items : list of (sentence, target) or (sentence, target, label) tuples,
+        where `target` is either a word/string (single-target mode) or a
+        `[word1, word2]` list/tuple (diff mode). `label` overrides the
+        auto-generated header.
+    word_agg, normalize : passed straight through to `explainer.explain`.
+    page_size : "A4" or "LETTER".
+    orientation : "portrait" or "landscape".
+    fontsize : starting token font size in points; auto-shrunk (down to
+        `min_fontsize`) so everything fits on one page.
+    color_scale : "global" (default, one intensity scale shared across all
+        sentences so they're comparable) or "per_sentence" (each sentence
+        normalized to its own max attribution, like the interactive version).
+    title : optional page title.
+    save_path : optional path to save the figure (png/pdf/svg...).
+    show : if True, calls plt.show().
+
+    Returns
+    -------
+    (fig, ax) : the matplotlib Figure/Axes for the rendered page.
+    """
+    page_sizes_in = {"A4": (8.27, 11.69), "LETTER": (8.5, 11.0)}
+    key = page_size.upper()
+    if key not in page_sizes_in:
+        raise ValueError(f"Unsupported page_size {page_size!r}; choose from {list(page_sizes_in)}")
+    w_in, h_in = page_sizes_in[key]
+    if orientation.lower() == "landscape":
+        w_in, h_in = h_in, w_in
+    elif orientation.lower() != "portrait":
+        raise ValueError("orientation must be 'portrait' or 'landscape'")
+
+    norm_items = []
+    for it in items:
+        if len(it) == 2:
+            sent, tgt, label = it[0], it[1], None
+        elif len(it) == 3:
+            sent, tgt, label = it
+        else:
+            raise ValueError("each item must be a (sentence, target) or (sentence, target, label) tuple")
+        norm_items.append((sent, tgt, label))
+    if not norm_items:
+        raise ValueError("items must contain at least one (sentence, target) pair")
+
+    mask_tok = getattr(explainer.tokenizer, "mask_token", "[MASK]")
+
+    # Pass 1: run the explainer once per pair, collect rows + a global score scale.
+    # "single" and "diff" items are kept on separate colour scales (see
+    # `_wrap_and_layout_sentences`), since they're not the same quantity.
+    results = []
+    all_scores = {"single": [], "diff": []}
+    for idx, (sent, tgt, label) in enumerate(norm_items, start=1):
+        is_diff = isinstance(tgt, (list, tuple))
+
+        if is_diff:
+            if len(tgt) != 2:
+                raise ValueError(
+                    f"diff-mode target must be a [word1, word2] pair, got {tgt!r} "
+                    f"(item {idx})"
+                )
+            w1, w2 = tgt
+            mode = "diff"
+            disp_label = label or f"{idx}. target: \"{w1}\" → \"{w2}\""
+            out_pair = explainer.explain(
+                [sent], [[w1, w2]], normalize=normalize, return_word_scores=True, word_agg=word_agg
+            )[0]
+            out1, out2 = out_pair[w1], out_pair[w2]
+            if out1.get("skipped", False) or out2.get("skipped", False):
+                reason = out1.get("reason") if out1.get("skipped", False) else out2.get("reason")
+                results.append((disp_label, f"{w1} → {w2}", [], True,
+                                 reason or "unknown reason", 0.0, mode))
+                continue
+            try:
+                rows = _merge_diff_rows(out1["word_attributions"], out2["word_attributions"], mask_tok)
+            except ValueError as e:
+                results.append((disp_label, f"{w1} → {w2}", [], True, str(e), 0.0, mode))
+                continue
+            display_target = f"{w1} → {w2}"
+        else:
+            mode = "single"
+            disp_label = label or f"{idx}. target: \"{tgt}\""
+            out = explainer.explain(
+                [sent], [[tgt]], normalize=normalize, return_word_scores=True, word_agg=word_agg
+            )[0][tgt]
+            if out.get("skipped", False):
+                results.append((disp_label, tgt, [], True, out.get("reason", "unknown reason"), 0.0, mode))
+                continue
+            rows = out["word_attributions"]
+            display_target = tgt
+
+        local_max = max((abs(s) for w, s in rows if w != mask_tok), default=0.0)
+        all_scores[mode].extend(abs(s) for w, s in rows if w != mask_tok)
+        results.append((disp_label, display_target, rows, False, None, local_max, mode))
+
+    global_max_abs = {m: max(scores, default=0.0) for m, scores in all_scores.items()}
+
+    # Reserve fixed space for an optional title (top) and legend (bottom); the
+    # remaining band is what gets auto-fit by shrinking the font size.
+    x_left, x_right = margin_in, w_in - margin_in
+    top_y = h_in - margin_in - (0.45 if title else 0.0)
+    bottom_y = margin_in + 0.35  # room for the legend strip
+
+    measure_fig = plt.figure(figsize=(w_in, h_in), dpi=dpi)
+    measure_fig.canvas.draw()
+    renderer = measure_fig.canvas.get_renderer()
+
+    cur_fontsize = float(fontsize)
+    ops, end_y = [], top_y
+    for _ in range(6):
+        ops, end_y = _wrap_and_layout_sentences(
+            measure_fig, renderer, results, cur_fontsize,
+            x_left, x_right, top_y, bottom_y, mask_tok, color_scale, global_max_abs,
+        )
+        if end_y >= bottom_y or cur_fontsize <= min_fontsize:
+            break
+        used, available = top_y - end_y, top_y - bottom_y
+        cur_fontsize = max(min_fontsize, cur_fontsize * (available / used) * 0.97)
+    plt.close(measure_fig)
+
+    if end_y < bottom_y:
+        print(
+            f"[plot_highlighted_sentences] Warning: content overflows the {page_size} page "
+            f"even at fontsize={cur_fontsize:.1f}pt (min_fontsize={min_fontsize}). "
+            "Consider fewer sentences, a larger page_size/orientation, or a lower min_fontsize."
+        )
+
+    fig, ax = plt.subplots(figsize=(w_in, h_in), dpi=dpi)
+    fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+    ax.set_xlim(0, w_in)
+    ax.set_ylim(0, h_in)
+    ax.axis("off")
+
+    if title:
+        ax.text(w_in / 2, h_in - margin_in / 2, title, fontsize=fontsize + 4,
+                 fontweight="bold", ha="center", va="center")
+
+    for op in ops:
+        if op["type"] == "rect":
+            edge = op.get("edge", "none")
+            ax.add_patch(Rectangle(
+                (op["x"], op["y"]), op["w"], op["h"],
+                facecolor=op["color"], edgecolor=edge, linewidth=1.0 if edge != "none" else 0,
+            ))
+        else:
+            ax.text(
+                op["x"], op["y"], op["s"], fontsize=op["fontsize"],
+                fontweight=op.get("weight", "normal"), style=op.get("style", "normal"),
+                color=op.get("color", "black"), ha=op.get("ha", "left"), va=op.get("va", "center"),
+            )
+
+    # Legend strip along the bottom margin, tailored to which mode(s) are on the page.
+    legend_y = margin_in - 0.05
+    has_single = any(r[6] == "single" for r in results)
+    has_diff = any(r[6] == "diff" for r in results)
+    legend_items = []
+    if has_single:
+        legend_items += [
+            ((30 / 255, 136 / 255, 229 / 255, 0.55), "predicts"),
+            ((229 / 255, 57 / 255, 53 / 255, 0.55), "opposes"),
+        ]
+    if has_diff:
+        legend_items += [
+            ((30 / 255, 136 / 255, 229 / 255, 0.55), "favours word₁"),
+            ((229 / 255, 57 / 255, 53 / 255, 0.55), "favours word₂"),
+        ]
+    legend_items.append(((1.0, 0.757, 0.027, 0.9), "[target] mask position"))
+    lx = x_left
+    for color, text in legend_items:
+        box_w, box_h = 0.18, 0.14
+        ax.add_patch(Rectangle((lx, legend_y), box_w, box_h, facecolor=color, edgecolor="none"))
+        w_in_txt, _ = _measure_text(fig, fig.canvas.get_renderer(), text, 8)
+        ax.text(lx + box_w + 0.06, legend_y + box_h / 2, text, fontsize=8, va="center", ha="left")
+        lx += box_w + 0.06 + w_in_txt + 0.35
+
+    if save_path:
+        fig.savefig(save_path, dpi=dpi)
+        print(f"Saved figure to {save_path}")
+    if show:
+        plt.show()
+
+    return fig, ax
+
+
 def _iter_comparison_rows(comparison, target):
     """
     Yields (sent_idx, rows) where rows is list[(word, s1, s2, diff)].
