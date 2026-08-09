@@ -5,7 +5,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
-from .explain import compare_explainers
+from .explain_deprc import compare_explainers
 from .analyse import  analyze_comparison
 import plotly.express as px
 import plotly.graph_objects as go

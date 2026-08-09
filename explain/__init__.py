@@ -1,5 +1,5 @@
 from .tools import pick_device, parse_pred_column, build_texts_targets,result_as_dataframe, add_mask_syntax_relation,_direct_dependency_relation_to_mask,add_mask_token_distance, merge_subtokens
-from .explain import MaskedLMExplainer, compare_explainers
+from .explain_deprc import MaskedLMExplainer, compare_explainers
 from .regression_analysis import RegressionAnalysis
 from .analyse import summarize_top_predictors, analyze_comparison, build_token_cluster_summary
 from .visualise import highlight_context_tokens, render_top_shift_sentences, plot_model_comparison_bar, plot_scatter_model_comparison, plot_token_embeddings_interactive, plot_semantic_squares,plot_highlighted_sentences 

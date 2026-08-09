@@ -69,7 +69,7 @@ import warnings
 
 import torch
 
-from .explain import MaskedLMExplainer
+from .explain_deprc import MaskedLMExplainer
 from .tools import pick_device
 
 
