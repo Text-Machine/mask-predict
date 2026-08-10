@@ -81,6 +81,9 @@ class MaskedLMExplainerImproved(MaskedLMExplainer):
         n_steps=50,
         internal_batch_size=None,
         convergence_warn_threshold=0.05,
+        auto_increase_steps=True,
+        max_n_steps=200,
+        step_growth=2.0,
     ):
         # Resolve device here (in this module's own namespace, where
         # `pick_device` actually exists) before calling into the parent
@@ -106,6 +109,16 @@ class MaskedLMExplainerImproved(MaskedLMExplainer):
         self.internal_batch_size = internal_batch_size
         self.convergence_warn_threshold = convergence_warn_threshold
 
+        # If the convergence delta exceeds `convergence_warn_threshold`,
+        # `_attribute_with_convergence` re-runs IG with n_steps multiplied by
+        # `step_growth` (capped at `max_n_steps`) instead of just warning.
+        # This trades runtime for accuracy: each retry is a full extra
+        # `ig.attribute()` call, so a chronically-high-delta model/target
+        # combination will consistently pay for every escalation step.
+        self.auto_increase_steps = auto_increase_steps
+        self.max_n_steps = max_n_steps
+        self.step_growth = step_growth
+
     def _build_baseline_ids(self, input_ids, mask_pos):
         """
         Baseline identical to `input_ids` at [CLS]/[SEP]/mask position(s),
@@ -120,6 +133,49 @@ class MaskedLMExplainerImproved(MaskedLMExplainer):
 
         ref = torch.full_like(input_ids, self.ref_token_id)
         return torch.where(keep_as_input, input_ids, ref)
+
+    def _attribute_with_convergence(self, emb, base, attention_mask, mpos, tid, valid, target):
+        """
+        Run `self.ig.attribute()`, escalating `n_steps` (up to `max_n_steps`,
+        by a factor of `step_growth` each retry) while the convergence delta
+        stays above `convergence_warn_threshold`. Returns whichever attempt
+        had the lowest delta, plus the delta and n_steps actually used, and
+        warns if it never got under threshold.
+        """
+        n_steps = self.n_steps
+        best_attrs = best_delta = best_n_steps = None
+
+        while True:
+            attrs, delta = self.ig.attribute(
+                inputs=emb,
+                baselines=base,
+                additional_forward_args=(attention_mask, mpos, tid, valid),
+                n_steps=n_steps,
+                internal_batch_size=self.internal_batch_size,
+                return_convergence_delta=True,
+            )
+            delta_val = float(delta.abs().max().item())
+
+            if best_delta is None or delta_val < best_delta:
+                best_attrs, best_delta, best_n_steps = attrs, delta_val, n_steps
+
+            converged = self.convergence_warn_threshold is None or best_delta <= self.convergence_warn_threshold
+            can_retry = self.auto_increase_steps and n_steps < self.max_n_steps
+            if converged or not can_retry:
+                break
+            n_steps = min(int(round(n_steps * self.step_growth)), self.max_n_steps)
+
+        if self.convergence_warn_threshold is not None and best_delta > self.convergence_warn_threshold:
+            warnings.warn(
+                f"IG convergence delta={best_delta:.4f} still exceeds threshold "
+                f"{self.convergence_warn_threshold} for target={target!r} "
+                f"after n_steps={best_n_steps} (max_n_steps={self.max_n_steps}); "
+                "attribution may be inaccurate. Consider raising max_n_steps or "
+                "the base n_steps.",
+                stacklevel=3,
+            )
+
+        return best_attrs, best_delta, best_n_steps
 
     def explain(
         self,
@@ -174,23 +230,11 @@ class MaskedLMExplainerImproved(MaskedLMExplainer):
                 tid = torch.tensor(target_ids, device=self.device).unsqueeze(0)
                 valid = torch.ones_like(tid, dtype=torch.float32, device=self.device)
 
-                # --- FIX 3: request convergence delta + expose n_steps.
-                attrs, delta = self.ig.attribute(
-                    inputs=emb,
-                    baselines=base,
-                    additional_forward_args=(attention_mask, mpos, tid, valid),
-                    n_steps=self.n_steps,
-                    internal_batch_size=self.internal_batch_size,
-                    return_convergence_delta=True,
+                # --- FIX 3: request convergence delta + expose n_steps;
+                # escalate n_steps automatically if it doesn't converge.
+                attrs, delta_val, n_steps_used = self._attribute_with_convergence(
+                    emb, base, attention_mask, mpos, tid, valid, target
                 )
-                delta_val = float(delta.abs().max().item())
-                if self.convergence_warn_threshold is not None and delta_val > self.convergence_warn_threshold:
-                    warnings.warn(
-                        f"IG convergence delta={delta_val:.4f} exceeds threshold "
-                        f"{self.convergence_warn_threshold} for target={target!r}; "
-                        "attribution may be inaccurate (consider raising n_steps).",
-                        stacklevel=2,
-                    )
 
                 attrs = attrs.sum(dim=-1).squeeze(0)
 
@@ -216,6 +260,7 @@ class MaskedLMExplainerImproved(MaskedLMExplainer):
                     "target_token_ids": target_ids,
                     "token_attributions": token_rows,
                     "convergence_delta": delta_val,
+                    "n_steps_used": n_steps_used,
                 }
 
                 if return_word_scores:
