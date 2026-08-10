@@ -82,7 +82,7 @@ def add_pseudo_perplexity_column(
     pin = device == "cuda"
 
     with torch.inference_mode(), autocast_ctx:
-        for text in tqdm(data_df[text_col].tolist(), desc="Pseudo-perplexity"):
+        for text in data_df[text_col].tolist():
             encoded = tokenizer(
                 text, truncation=True, max_length=max_length, return_tensors="pt"
             )
